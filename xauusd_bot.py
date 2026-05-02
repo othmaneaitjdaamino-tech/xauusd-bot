@@ -1,205 +1,205 @@
-import requests
-import time
 import os
+import time
+import logging
+import requests
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 
-# ═══════════════════════════════════════════
-#  تحميل المتغيرات من ملف .env
-# ═══════════════════════════════════════════
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID   = os.getenv("CHAT_ID")
-CAPITAL   = float(os.getenv("CAPITAL", 1000))
+CHAT_ID = os.getenv("CHAT_ID")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-if not BOT_TOKEN or not CHAT_ID:
-    raise ValueError("❌ BOT_TOKEN أو CHAT_ID غير موجودين في ملف .env")
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger(__name__)
 
-# ═══════════════════════════════════════════
-#  متغيرات الحالة
-# ═══════════════════════════════════════════
-daily_loss_pct     = 0.0
-consecutive_losses = 0
-trades_today       = 0
-bot_stopped        = False
+PAIRS = [
+    "XAUUSD", "EURUSD", "GBPUSD", "USDJPY", "USDCHF",
+    "AUDUSD", "NZDUSD", "USDCAD", "GBPJPY", "EURJPY", "XAGUSD"
+]
 
-# ═══════════════════════════════════════════
-#  إرسال رسالة Telegram
-# ═══════════════════════════════════════════
-def send(text):
+KILLZONES = {
+    "Asia":   (0, 3),
+    "London": (7, 10),
+    "NY":     (12, 15),
+}
+
+HIGH_IMPACT_NEWS_HOURS = []
+
+
+def send_message(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    requests.post(url, json={
-        "chat_id": CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML"
-    })
-
-# ═══════════════════════════════════════════
-#  1. فحص Killzone (London / NY)
-# ═══════════════════════════════════════════
-def check_killzone():
-    now  = datetime.now(timezone.utc)
-    hour = now.hour
-
-    if 7 <= hour < 10:
-        return "🇬🇧 London Killzone", True
-
-    if 12 <= hour < 15:
-        return "🇺🇸 New York Killzone", True
-
-    return None, False
-
-# ═══════════════════════════════════════════
-#  2. فحص أخبار Forex Factory (مبسط)
-# ═══════════════════════════════════════════
-def check_news():
-    now = datetime.now(timezone.utc)
-    high_impact_hours = [14, 15, 18, 20]
-
-    for h in high_impact_hours:
-        news_time = now.replace(hour=h, minute=30, second=0)
-        diff = abs((news_time - now).total_seconds() / 60)
-        if diff <= 30:
-            return True, f"⚠️ خبر USD قريب ({h}:30 UTC)"
-
-    return False, None
-
-# ═══════════════════════════════════════════
-#  3. جلب سعر XAUUSD
-# ═══════════════════════════════════════════
-def get_price():
+    data = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
     try:
-        r = requests.get("https://api.metals.live/v1/spot/gold", timeout=5)
-        return round(r.json()["price"], 2)
-    except:
+        r = requests.post(url, data=data, timeout=10)
+        log.info(f"Telegram: {r.status_code}")
+    except Exception as e:
+        log.error(f"خطأ: {e}")
+
+
+def get_price(pair):
+    try:
+        if pair == "XAUUSD":
+            r = requests.get("https://api.metals.live/v1/spot/gold", timeout=5)
+            return round(float(r.json()[0].get("price", 0)), 2)
+        elif pair == "XAGUSD":
+            r = requests.get("https://api.metals.live/v1/spot/silver", timeout=5)
+            return round(float(r.json()[0].get("price", 0)), 2)
+        else:
+            base = pair[:3]
+            quote = pair[3:]
+            r = requests.get(f"https://open.er-api.com/v6/latest/{base}", timeout=5)
+            data = r.json()
+            if data.get("result") == "success":
+                return round(float(data["rates"].get(quote, 0)), 5)
+    except Exception as e:
+        log.error(f"خطأ سعر {pair}: {e}")
+    return None
+
+
+def get_session(hour):
+    for name, (start, end) in KILLZONES.items():
+        if start <= hour < end:
+            return f"🎯 {name} Killzone"
+    return None
+
+
+def is_news_time(hour, minute):
+    for news_hour in HIGH_IMPACT_NEWS_HOURS:
+        news_minutes = news_hour * 60
+        current_minutes = hour * 60 + minute
+        if abs(current_minutes - news_minutes) <= 30:
+            return True
+    return False
+
+
+def analyze_with_gemini(pair, price, session, time_utc, hour, minute):
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+
+    news_status = "❌ يوجد خبر قريب!" if is_news_time(hour, minute) else "✅ لا يوجد خبر"
+    session_status = f"✅ نعم — {session}" if session else "❌ لا"
+
+    prompt = f"""
+أنت محلل فوريكس خبير يستخدم استراتيجية ICT / Smart Money الكاملة.
+
+الزوج: {pair}
+السعر الحالي: {price}
+الوقت: {time_utc} UTC
+الجلسة: {session if session else 'خارج Killzone'}
+
+طبق هذه المراحل:
+
+🔴 المرحلة 0: الإطار الكبير
+- الاتجاه على Weekly وDaily؟
+
+🔴 المرحلة 1: Daily Bias
+- Bias = Bullish / Bearish / Neutral؟
+- BOS أو CHOCH؟
+- DXY اتجاه؟
+
+🔴 المرحلة 2: حالة السوق
+- Trending أم Range؟
+- قريب من Weekly High/Low؟
+
+🔴 المرحلة 3: Setup
+- Liquidity Sweep؟
+- Displacement قوي؟
+- MSS أو BOS؟
+- FVG واضح؟
+
+🔴 المرحلة 4: منطقة الدخول
+- OB أو FVG أو Breaker الأقرب؟
+- شمعة التأكيد المطلوبة؟
+
+🔴 المرحلة 5: الفلاتر الـ 6
+1. داخل Killzone؟ {session_status}
+2. لا يوجد News؟ {news_status}
+3. R:R لا يقل عن 1:3؟
+4. SMT مع DXY؟
+5. HTF Confluence مع 4H أو Daily؟
+6. حجم الشمعة أكبر من المتوسط؟
+
+🔴 المرحلة 6: إدارة المخاطر
+- Entry:
+- SL:
+- TP1 (1:2):
+- TP2:
+- R:R النهائي:
+
+📊 الخلاصة:
+- قرار: LONG / SHORT / لا تدخل
+- نسبة الثقة: X%
+- سبب موجز
+
+⚠️ مخاطرة 1% فقط — صفقة واحدة — انتظر التأكيد.
+"""
+
+    body = {"contents": [{"parts": [{"text": prompt}]}]}
+    try:
+        r = requests.post(url, json=body, timeout=30)
+        result = r.json()
+        return result["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception as e:
+        log.error(f"خطأ Gemini ({pair}): {e}")
         return None
 
-# ═══════════════════════════════════════════
-#  4. Checklist كاملة
-# ═══════════════════════════════════════════
-def build_checklist(killzone_name, price):
-    now         = datetime.now(timezone.utc)
-    risk_amount = round(CAPITAL * 0.01, 2)
 
-    checklist = f"""
-📋 <b>CHECKLIST — XAUUSD</b>
-🕐 {now.strftime('%H:%M')} UTC
-
-💰 السعر الحالي: <b>{price}$</b>
-📍 الجلسة: <b>{killzone_name}</b>
-
-━━━━━━━━━━━━━━━━━━━
-<b>✅ فلاتر الدخول — راجع يدوياً:</b>
-
-1️⃣ Daily Bias محدد؟ (Bullish / Bearish)
-   → افتح Daily وتحقق من BOS/CHOCH
-
-2️⃣ Liquidity Sweep واضح؟
-   → هل تم كسر High/Low سابق؟
-
-3️⃣ Displacement قوي؟ (+3 شمعات)
-   → هل في اندفاع قوي بعد السويب؟
-
-4️⃣ FVG أو OB واضح؟
-   → حدد المنطقة على الشارت
-
-5️⃣ شمعة تأكيد؟
-   → Engulfing أو Pinbar أو Strong Close
-
-6️⃣ HTF Confluence؟ (4H أو Daily)
-   → هل الـ 4H يوافق؟
-
-7️⃣ SMT مع DXY؟
-   → افتح DXY وقارن
-
-━━━━━━━━━━━━━━━━━━━
-<b>📊 إدارة المخاطر:</b>
-💵 رأس المال: {CAPITAL}$
-⚠️ مخاطرة 1%: <b>{risk_amount}$</b>
-🎯 R:R لا يقل عن 1:3
-📌 TP1 عند 1:2 → أغلق 50%
-📌 انقل SL إلى Breakeven
-📌 TP2 عند Liquidity Pool التالية
-
-━━━━━━━━━━━━━━━━━━━
-<b>📈 إحصائيات اليوم:</b>
-🔢 صفقات اليوم: {trades_today}
-📉 خسارة اليوم: {daily_loss_pct}%
-🔴 خسائر متتالية: {consecutive_losses}
-
-━━━━━━━━━━━━━━━━━━━
-⚡ <b>القرار النهائي لك أنت!</b>
-لا تدخل إلا إذا ✅ كل النقاط
-    """
-    return checklist
-
-# ═══════════════════════════════════════════
-#  5. تحذير إيقاف
-# ═══════════════════════════════════════════
-def send_stop_warning(reason):
-    msg = f"""
-🛑 <b>STOP TRADING — توقف الآن!</b>
-
-❌ السبب: {reason}
-
-قواعدك تقول: توقف فوراً!
-لا تفتح أي صفقة جديدة اليوم 🚫
-    """
-    send(msg)
-
-# ═══════════════════════════════════════════
-#  الحلقة الرئيسية
-# ═══════════════════════════════════════════
 def main():
-    global bot_stopped, daily_loss_pct, consecutive_losses, trades_today
+    send_message(
+        "🤖 <b>بوت الفوريكس AI — يعمل الآن</b>\n\n"
+        "📋 الاستراتيجية: ICT / Smart Money\n"
+        "🎯 الأزواج: XAUUSD | EURUSD | GBPUSD | USDJPY | وأكثر\n"
+        "⏰ Killzones: London 07-10 | NY 12-15 | Asia 00-03 UTC\n\n"
+        "✅ البوت يراقب السوق..."
+    )
 
-    send("🤖 <b>بوت XAUUSD شغّال!</b>\nسيرسل تنبيهات Killzone تلقائياً ✅")
-
-    last_reset = datetime.now(timezone.utc).date()
+    sent_sessions = {}
 
     while True:
-        now_date = datetime.now(timezone.utc).date()
+        now = datetime.now(timezone.utc)
+        hour = now.hour
+        minute = now.minute
+        time_utc = now.strftime("%H:%M")
+        session = get_session(hour)
+        session_key = f"{now.date()}_{session}"
 
-        # ريست يومي منتصف الليل
-        if now_date != last_reset:
-            daily_loss_pct     = 0.0
-            consecutive_losses = 0
-            trades_today       = 0
-            bot_stopped        = False
-            last_reset         = now_date
-            send("🌅 <b>يوم جديد!</b> تم ريست الإحصائيات ✅")
-
-        if bot_stopped:
-            time.sleep(60)
+        if not session:
+            log.info("خارج Killzone — انتظار...")
+            time.sleep(300)
             continue
 
-        if consecutive_losses >= 2:
-            bot_stopped = True
-            send_stop_warning("خسرت صفقتين متتاليتين")
-            time.sleep(60)
+        if is_news_time(hour, minute):
+            send_message("⚠️ <b>خبر مهم قريب — البوت متوقف 30 دقيقة</b>")
+            time.sleep(1800)
             continue
 
-        if daily_loss_pct >= 3.0:
-            bot_stopped = True
-            send_stop_warning(f"تجاوزت 3% خسارة يومية ({daily_loss_pct}%)")
-            time.sleep(60)
-            continue
+        for pair in PAIRS:
+            pair_key = f"{pair}_{session_key}"
+            if pair_key in sent_sessions:
+                continue
 
-        killzone_name, in_killzone = check_killzone()
+            price = get_price(pair)
+            if not price:
+                continue
 
-        if in_killzone:
-            has_news, news_msg = check_news()
+            log.info(f"تحليل {pair} @ {price}")
+            analysis = analyze_with_gemini(pair, price, session, time_utc, hour, minute)
 
-            if has_news:
-                send(f"⚠️ <b>Killzone نشطة لكن...</b>\n{news_msg}\n\n🚫 انتظر انتهاء الخبر!")
-            else:
-                price = get_price()
-                if price:
-                    checklist = build_checklist(killzone_name, price)
-                    send(checklist)
+            if analysis:
+                header = f"📊 <b>تحليل {pair}</b>\n💰 السعر: <b>{price}</b>\n🕐 {time_utc} UTC\n📍 {session}\n{'='*25}\n\n"
+                msg = header + analysis
+                if len(msg) > 4000:
+                    send_message(msg[:4000])
+                    time.sleep(2)
+                    send_message(msg[4000:])
+                else:
+                    send_message(msg)
+                sent_sessions[pair_key] = True
+                time.sleep(5)
 
-        time.sleep(300)
+        time.sleep(60)
+
 
 if __name__ == "__main__":
     main()
